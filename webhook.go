@@ -107,12 +107,14 @@ type WebhookConfig struct {
 	// an error to have 9in retry the delivery later.
 	Handle func(ctx context.Context, event *WebhookEvent) error
 	// Store remembers processed event ids so each event is handled once. Default: in
-	// memory (one process). With several instances, use a shared store.
-	Store EventStore
+	// memory (one process). With several instances, use a shared store (the same one
+	// can serve the Verifier).
+	Store Store
 	// TTL is how long processed ids are remembered. Default 3 days.
 	TTL time.Duration
 	// Verifier is a hybrid verifier to keep current: every verified event goes to its
 	// HandleEvent, so token.revoked, session.revoked and user.* evict cached answers.
+	// When that fails (its shared Store is down), the delivery gets a 500 and 9in retries.
 	Verifier *Verifier
 	// Path is the path 9in posts to, when a proxy rewrites it before it reaches you.
 	// Default: the request path as received.
@@ -129,7 +131,8 @@ type WebhookConfig struct {
 //   - 204 when the event was handled, or had already been (a retry or redelivery);
 //   - 409 while another delivery of the same event is still being handled (9in retries);
 //   - 401 for a bad signature, 400 for a body that isn't an event, 405 for non-POST;
-//   - 500 when Handle failed (the event id is released, so 9in's retry handles it).
+//   - 500 when Handle failed (the event id is released, so 9in's retry handles it), or when
+//     the Verifier couldn't record a revocation in its shared Store.
 //
 // It panics when no secret is given (a configuration error, found at startup).
 func WebhookHandler(cfg WebhookConfig) http.Handler {
@@ -139,7 +142,7 @@ func WebhookHandler(cfg WebhookConfig) http.Handler {
 	}
 	store := cfg.Store
 	if store == nil {
-		store = NewMemoryEventStore()
+		store = NewMemoryStore()
 	}
 	dedupe := &EventDeduplicator{Store: store, TTL: cfg.TTL}
 	onError := cfg.OnError
@@ -167,7 +170,11 @@ func WebhookHandler(cfg WebhookConfig) http.Handler {
 			return
 		}
 		if cfg.Verifier != nil {
-			cfg.Verifier.HandleEvent(r.Context(), event)
+			if _, err := cfg.Verifier.HandleEvent(r.Context(), event); err != nil {
+				onError(r, err)
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "store_failed"})
+				return
+			}
 		}
 		handle := func(ctx context.Context) error {
 			if cfg.Handle == nil {

@@ -224,7 +224,7 @@ func ExampleWebhookHandler() {
 			}
 			return nil
 		},
-		// Store: a shared EventStore (Redis SET NX…) when you run several instances.
+		// Store: a shared nine.Store (Redis SET NX…) when you run several instances.
 	}))
 }
 
@@ -249,7 +249,7 @@ func ExampleVerifyWebhook() {
 	})
 }
 
-var store = nine.NewMemoryEventStore()
+var store = nine.NewMemoryStore()
 
 func handle(context.Context, *nine.WebhookEvent) error { return nil }
 

@@ -1003,10 +1003,15 @@ func liveConfidential(t *testing.T, ctx context.Context, start int64) {
 		hybrid := mustLive[*nine.Verifier](t)(nine.NewVerifier(nine.VerifierConfig{Issuer: issuer, Audience: audience, ClientID: clientID, ClientSecret: secret}))
 		introspect := mustLive[*nine.Verifier](t)(nine.NewVerifier(nine.VerifierConfig{Issuer: issuer, Audience: audience, ClientID: clientID, ClientSecret: secret, Mode: nine.ModeIntrospect}))
 		local := mustLive[*nine.Verifier](t)(nine.NewVerifier(nine.VerifierConfig{Issuer: issuer, Audience: audience}))
+		// Two processes of one API sharing a Store: the webhook reaches only the second.
+		shared := nine.NewMemoryStore()
+		processA := mustLive[*nine.Verifier](t)(nine.NewVerifier(nine.VerifierConfig{Issuer: issuer, Audience: audience, ClientID: clientID, ClientSecret: secret, Store: shared}))
+		processB := mustLive[*nine.Verifier](t)(nine.NewVerifier(nine.VerifierConfig{Issuer: issuer, Audience: audience, ClientID: clientID, ClientSecret: secret, Store: shared}))
 		if hybrid.Mode() != nine.ModeHybrid {
 			t.Fatal("hybrid is the default with client credentials")
 		}
 		claims := mustLive[nine.Claims](t)(hybrid.Verify(ctx, tokens.AccessToken, "read:things"))
+		mustLive[nine.Claims](t)(processA.Verify(ctx, tokens.AccessToken, "read:things"))
 		if _, err := hybrid.Verify(ctx, tokens.AccessToken, "write:things"); !errors.Is(err, nine.ErrInsufficientScope) {
 			t.Fatal(err)
 		}
@@ -1021,6 +1026,9 @@ func liveConfidential(t *testing.T, ctx context.Context, start int64) {
 		}
 		if _, err := hybrid.Verify(ctx, tokens.AccessToken); err != nil {
 			t.Fatalf("hybrid: the cached answer until 9in tells us: %v", err)
+		}
+		if _, err := processA.Verify(ctx, tokens.AccessToken); err != nil {
+			t.Fatalf("shared store: the cached answer until 9in tells us: %v", err)
 		}
 		if !hasSetting("RECEIVER_URL") {
 			t.Skip("no receiver")
@@ -1046,6 +1054,18 @@ func liveConfidential(t *testing.T, ctx context.Context, start int64) {
 		}
 		if _, err := hybrid.Verify(ctx, tokens.AccessToken); !errors.Is(err, nine.ErrInvalidToken) {
 			t.Fatalf("hybrid after the webhook: %v", err)
+		}
+		// The same delivery reaching process B makes process A ask 9in again.
+		hB := nine.WebhookHandler(nine.WebhookConfig{Secret: setting(t, "WEBHOOK_SECRET"), Verifier: processB})
+		r = httptest.NewRequest(http.MethodPost, hook.Path, bytes.NewReader([]byte(hook.Raw)))
+		r.Header.Set(nine.SignatureHeader, hook.Signature)
+		w = httptest.NewRecorder()
+		hB.ServeHTTP(w, r)
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("webhook to process B: %d %s", w.Code, w.Body)
+		}
+		if _, err := processA.Verify(ctx, tokens.AccessToken); !errors.Is(err, nine.ErrInvalidToken) {
+			t.Fatalf("process A after process B got the webhook: %v", err)
 		}
 	})
 

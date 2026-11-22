@@ -203,9 +203,74 @@ mux.Handle("POST /nine/webhook", nine.WebhookHandler(nine.WebhookConfig{
 | `nine.ModeHybrid` | Local check, then one introspection per token. The answer is cached until a webhook says otherwise or `CacheTTL` passes; a refusal is cached until the token expires. The default with client credentials. |
 | `nine.ModeIntrospect` | Introspection on every call. |
 
-Opaque access tokens (`9in_at_…`) are always introspected, and cached in hybrid mode. The
-cache is in memory, per process; implement `nine.AnswerCache` to share it, or give each
-process the webhooks.
+Opaque access tokens (`9in_at_…`) are always introspected, and cached in hybrid mode.
+
+### Several processes: a shared Store
+
+By default each process keeps its answers in memory, so a revocation webhook only reaches the
+process that receives it; the others trust their cached answer for up to `CacheTTL`. Give
+every process the same `nine.Store` and the webhook reaches them all: the process that gets
+it writes a small revocation marker (for the token's `jti`, the session's `sid` or the user),
+and every process checks the markers before trusting a cached answer.
+
+```go
+store := RedisStore{rdb} // any nine.Store: four methods, see below
+
+verifier, err := nine.NewVerifier(nine.VerifierConfig{
+	Issuer: "https://acme.9in.io", Audience: "https://api.acme.com",
+	ClientID: os.Getenv("NINE_CLIENT_ID"), ClientSecret: os.Getenv("NINE_CLIENT_SECRET"),
+	Store: store,
+})
+mux.Handle("POST /nine/webhook", nine.WebhookHandler(nine.WebhookConfig{
+	Secret: os.Getenv("NINE_WEBHOOK_SECRET"), Verifier: verifier,
+	Store: store, // the same store also makes each event run once across processes
+}))
+```
+
+A `nine.Store` is a key-value store with expiry: `Get`, `Set`, `Delete`, and an atomic `Add`
+(store only if the key is missing). With [go-redis](https://github.com/redis/go-redis):
+
+```go
+type RedisStore struct{ rdb *redis.Client }
+
+func (s RedisStore) Get(ctx context.Context, key string) (string, bool, error) {
+	v, err := s.rdb.Get(ctx, key).Result()
+	if errors.Is(err, redis.Nil) {
+		return "", false, nil
+	}
+	return v, err == nil, err
+}
+
+func (s RedisStore) Set(ctx context.Context, key, value string, ttl time.Duration) error {
+	return s.rdb.Set(ctx, key, value, ttl).Err()
+}
+
+func (s RedisStore) Add(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	return s.rdb.SetNX(ctx, key, value, ttl).Result()
+}
+
+func (s RedisStore) Delete(ctx context.Context, key string) error {
+	return s.rdb.Del(ctx, key).Err()
+}
+
+// Optional (nine.MultiGetter): read an answer's markers in one round trip.
+func (s RedisStore) GetMany(ctx context.Context, keys []string) ([]string, []bool, error) {
+	vals, err := s.rdb.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, nil, err
+	}
+	out, ok := make([]string, len(vals)), make([]bool, len(vals))
+	for i, v := range vals {
+		out[i], ok[i] = v.(string)
+	}
+	return out, ok, nil
+}
+```
+
+Use a store that keeps keys until they expire (for Redis, a `noeviction` or `volatile-*`
+policy): a store that drops keys early under memory pressure can let a webhook run twice.
+When the store can't be read, the verifier asks 9in instead of trusting a cached answer; when
+a revocation can't be written, `WebhookHandler` answers 500 so 9in delivers the event again.
 
 ## Manage users
 
@@ -305,7 +370,7 @@ mux.Handle("POST /nine/webhook", nine.WebhookHandler(nine.WebhookConfig{
 		}
 		return nil // an error answers 500 and 9in retries later
 	},
-	// Store: a shared nine.EventStore (Redis SET NX, a SQL unique key) with several instances.
+	// Store: a shared nine.Store (Redis SET NX, a SQL unique key) with several instances.
 }))
 ```
 

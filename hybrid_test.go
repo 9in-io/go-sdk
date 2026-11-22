@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,9 +33,6 @@ func hybridSetup(t *testing.T, mode Mode) (*Verifier, *fakeIssuer, *sync.Map, *c
 	v := newTestVerifier(t, f, VerifierConfig{Audience: "https://api.acme.test", Mode: mode, ClientID: "app_server", ClientSecret: "s3cret:with/chars"})
 	c := newClock()
 	v.now = c.Now
-	if m, ok := v.answers.(*MemoryAnswerCache); ok {
-		m.now = c.Now
-	}
 	return v, f, active, c
 }
 
@@ -108,6 +104,14 @@ func TestHybridRevocationWebhooksEvict(t *testing.T) {
 	event := func(typ string, data map[string]any) *WebhookEvent {
 		return &WebhookEvent{ID: "evt", EventType: typ, Data: data}
 	}
+	evicted := func(e *WebhookEvent) int {
+		t.Helper()
+		n, err := v.HandleEvent(ctx, e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
 	// Events that don't concern cached tokens evict nothing.
 	for _, e := range []*WebhookEvent{
 		event("token.revoked", map[string]any{"token_type": "refresh_token", "jti": "jti_a"}),
@@ -117,14 +121,14 @@ func TestHybridRevocationWebhooksEvict(t *testing.T) {
 		event("session.revoked", map[string]any{"sid": "sid_zzz"}),
 		nil,
 	} {
-		if n := v.HandleEvent(ctx, e); n != 0 {
+		if n := evicted(e); n != 0 {
 			t.Fatalf("%v evicted %d", e, n)
 		}
 	}
-	if n := v.HandleEvent(ctx, event("token.revoked", map[string]any{"token_type": "access_token", "jti": "jti_a"})); n != 1 {
+	if n := evicted(event("token.revoked", map[string]any{"token_type": "access_token", "jti": "jti_a"})); n != 1 {
 		t.Fatalf("token.revoked evicted %d", n)
 	}
-	if n := v.HandleEvent(ctx, event("session.revoked", map[string]any{"sid": "sid_b"})); n != 1 {
+	if n := evicted(event("session.revoked", map[string]any{"sid": "sid_b"})); n != 1 {
 		t.Fatalf("session.revoked evicted %d", n)
 	}
 	for _, typ := range []string{"user.sessions_revoked", "user.deleted", "user.updated", "user.password_changed"} {
@@ -133,7 +137,7 @@ func TestHybridRevocationWebhooksEvict(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		if n := v.HandleEvent(ctx, event(typ, map[string]any{"user": map[string]any{"id": "usr_c"}})); n != 2 {
+		if n := evicted(event(typ, map[string]any{"user": map[string]any{"id": "usr_c"}})); n != 2 {
 			t.Fatalf("%s evicted %d", typ, n)
 		}
 	}
@@ -191,7 +195,7 @@ func TestHybridNeverCachesPastExpiry(t *testing.T) {
 	if _, err := v.Verify(ctx, token); err != nil {
 		t.Fatal(err)
 	}
-	hit, ok := v.answers.Get(ctx, tokenKey(token))
+	hit, ok := v.answers.get(ctx, tokenKey(token))
 	if !ok || hit.Until.Unix() != exp {
 		t.Fatalf("cached until %v, want the token's expiry %d", hit.Until, exp)
 	}
@@ -342,63 +346,27 @@ func TestAWaitingCallerCanGiveUp(t *testing.T) {
 	}
 }
 
-// A custom AnswerCache sees every Set, Get and Evict.
-type recordingCache struct {
-	*MemoryAnswerCache
-	mu     sync.Mutex
-	events []string
-}
-
-func (r *recordingCache) Set(ctx context.Context, key string, a CachedAnswer) {
-	r.mu.Lock()
-	r.events = append(r.events, "set")
-	r.mu.Unlock()
-	r.MemoryAnswerCache.Set(ctx, key, a)
-}
-
-func (r *recordingCache) Evict(ctx context.Context, claim, value string) int {
-	r.mu.Lock()
-	r.events = append(r.events, "evict:"+claim+"="+value)
-	r.mu.Unlock()
-	return r.MemoryAnswerCache.Evict(ctx, claim, value)
-}
-
-func TestPluggableAnswerCache(t *testing.T) {
-	f := newFakeIssuer(t)
-	f.setKeys(asymmetricKeys(t)...)
-	token := makeToken(t, "ES256", nil, claimsFor(f.issuer, nil))
-	f.introspect = func(*http.Request, url.Values) (int, any) { return 200, activeClaims(f.issuer, nil) }
-	cache := &recordingCache{MemoryAnswerCache: NewMemoryAnswerCache(0)}
-	v := newTestVerifier(t, f, VerifierConfig{ClientID: "a", ClientSecret: "b", Cache: cache})
-	_, _ = v.Verify(ctx, token)
-	v.HandleEvent(ctx, &WebhookEvent{EventType: "session.revoked", Data: map[string]any{"sid": "sid_1"}})
-	if strings.Join(cache.events, ",") != "set,evict:sid=sid_1" {
-		t.Fatalf("events %v", cache.events)
-	}
-	v.Clear(ctx)
-	if cache.Len() != 0 {
-		t.Fatal("Clear")
-	}
-}
-
-func TestMemoryAnswerCacheIsLRU(t *testing.T) {
-	c := NewMemoryAnswerCache(2)
+func TestMemoryAnswersAreLRU(t *testing.T) {
+	c := newMemoryAnswers(2, time.Now)
 	until := time.Now().Add(time.Hour)
-	c.Set(ctx, "a", CachedAnswer{Claims: Claims{"sub": "a"}, Until: until})
-	c.Set(ctx, "b", CachedAnswer{Claims: Claims{"sub": "b"}, Until: until})
-	c.Get(ctx, "a") // a is now the most recently used
-	c.Set(ctx, "c", CachedAnswer{Claims: Claims{"sub": "c"}, Until: until})
-	if _, ok := c.Get(ctx, "b"); ok {
+	c.set(ctx, "a", cachedAnswer{Claims: Claims{"sub": "a"}, Until: until})
+	c.set(ctx, "b", cachedAnswer{Claims: Claims{"sub": "b"}, Until: until})
+	c.get(ctx, "a") // a is now the most recently used
+	c.set(ctx, "c", cachedAnswer{Claims: Claims{"sub": "c"}, Until: until})
+	if _, ok := c.get(ctx, "b"); ok {
 		t.Fatal("b should have been dropped")
 	}
-	if _, ok := c.Get(ctx, "a"); !ok {
+	if _, ok := c.get(ctx, "a"); !ok {
 		t.Fatal("a should be kept")
 	}
-	c.Set(ctx, "old", CachedAnswer{Until: time.Now().Add(-time.Second)})
-	if _, ok := c.Get(ctx, "old"); ok {
+	c.set(ctx, "old", cachedAnswer{Until: time.Now().Add(-time.Second)})
+	if _, ok := c.get(ctx, "old"); ok {
 		t.Fatal("expired answers are misses")
 	}
-	if c.Evict(ctx, "sub", "") != 0 {
+	if n, _ := c.evict(ctx, "sub", ""); n != 0 {
 		t.Fatal("an empty value evicts nothing")
+	}
+	if err := c.clear(ctx); err != nil || c.len() != 0 {
+		t.Fatal("clear")
 	}
 }

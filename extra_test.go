@@ -158,9 +158,9 @@ func TestErrorFormatting(t *testing.T) {
 	if got := describeNetworkError(cause); got != http.ErrHandlerTimeout.Error() {
 		t.Fatalf("the URL must not leak into the description: %q", got)
 	}
-	data, _ := json.Marshal(CachedAnswer{Claims: Claims{"sub": "x"}, Until: time.Unix(0, 0).UTC()})
-	if string(data) != `{"claims":{"sub":"x"},"until":"1970-01-01T00:00:00Z"}` {
-		t.Fatalf("CachedAnswer JSON %s", data)
+	data, _ := json.Marshal(storedAnswer{Claims: Claims{"sub": "x"}, Until: 2000, At: 1000})
+	if string(data) != `{"c":{"sub":"x"},"u":2000,"t":1000}` {
+		t.Fatalf("stored answer JSON %s", data)
 	}
 }
 

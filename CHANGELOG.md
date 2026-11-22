@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.0
+
+Hybrid verification shares answers and revocations across processes, through one small store
+interface for everything the SDK keeps between requests.
+
+- `Store`: a key-value store with expiry (`Get`, `Set`, atomic `Add`, `Delete`), optionally
+  `MultiGetter` (`GetMany`). `MemoryStore` is the one-process implementation. It is the same
+  interface as 0.1.0's `EventStore`, so an existing implementation keeps working; `EventStore`,
+  `MemoryEventStore` and `NewMemoryEventStore` remain as deprecated aliases.
+- `VerifierConfig.Store`: with a shared store, every process sees the answers 9in gave and the
+  revocations any process received. The process that gets a `token.revoked`,
+  `session.revoked` or `user.*` webhook writes a revocation marker for the `jti`, `sid` or user,
+  and every process checks those markers before trusting a cached answer (answers are dated
+  when 9in was asked, with an allowance for clocks that disagree). Without a store the
+  in-memory, per-process cache is unchanged.
+- `WebhookHandler` answers 500 when the verifier can't record a revocation in its shared store,
+  so 9in delivers the event again.
+
+Breaking (Go 0.x):
+
+- `VerifierConfig.Cache`, `AnswerCache`, `CachedAnswer`, `MemoryAnswerCache` and
+  `NewMemoryAnswerCache` are removed. An `AnswerCache` had to find answers by claim to evict
+  them, which a plain key-value store can't do; use `VerifierConfig.Store`.
+- `Verifier.HandleEvent` returns `(int, error)` and `Verifier.Clear` returns `error`, so a
+  store failure isn't lost.
+
 ## 0.1.0
 
 The first release of the official Go SDK for 9in (`github.com/9in-io/go-sdk`, package `nine`).

@@ -2,85 +2,24 @@ package nine
 
 import (
 	"context"
-	"sync"
 	"time"
 )
 
-// EventStore is a key-value store for processing each event once. Add must be atomic:
-// insert only when the key is absent or expired, and report whether it did. Use Redis
-// SET NX EX, an SQL table with a unique key, or [MemoryEventStore] for one process.
-type EventStore interface {
-	Add(ctx context.Context, key, value string, ttl time.Duration) (bool, error)
-	Get(ctx context.Context, key string) (value string, ok bool, err error)
-	Set(ctx context.Context, key, value string, ttl time.Duration) error
-	Delete(ctx context.Context, key string) error
-}
+// EventStore is the [Store] that [EventDeduplicator] and [WebhookHandler] keep event ids in.
+//
+// Deprecated: use [Store], the same interface (renamed in 0.2.0, when the hybrid
+// [Verifier] started using it too).
+type EventStore = Store
 
-// MemoryEventStore is an in-memory EventStore for one process (tests, a single server).
-type MemoryEventStore struct {
-	mu    sync.Mutex
-	items map[string]memoryItem
-	now   func() time.Time
-}
+// MemoryEventStore is the in-memory [Store].
+//
+// Deprecated: use [MemoryStore] (renamed in 0.2.0).
+type MemoryEventStore = MemoryStore
 
-type memoryItem struct {
-	value   string
-	expires time.Time
-}
-
-// NewMemoryEventStore returns an empty MemoryEventStore.
-func NewMemoryEventStore() *MemoryEventStore {
-	return &MemoryEventStore{items: make(map[string]memoryItem), now: time.Now}
-}
-
-func (s *MemoryEventStore) live(key string) (memoryItem, bool) {
-	item, ok := s.items[key]
-	if ok && !item.expires.After(s.now()) {
-		delete(s.items, key)
-		return memoryItem{}, false
-	}
-	return item, ok
-}
-
-// Add implements EventStore.
-func (s *MemoryEventStore) Add(_ context.Context, key, value string, ttl time.Duration) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.live(key); ok {
-		return false, nil
-	}
-	s.items[key] = memoryItem{value: value, expires: s.now().Add(ttl)}
-	if len(s.items) > 10000 {
-		for k := range s.items {
-			s.live(k)
-		}
-	}
-	return true, nil
-}
-
-// Get implements EventStore.
-func (s *MemoryEventStore) Get(_ context.Context, key string) (string, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	item, ok := s.live(key)
-	return item.value, ok, nil
-}
-
-// Set implements EventStore.
-func (s *MemoryEventStore) Set(_ context.Context, key, value string, ttl time.Duration) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.items[key] = memoryItem{value: value, expires: s.now().Add(ttl)}
-	return nil
-}
-
-// Delete implements EventStore.
-func (s *MemoryEventStore) Delete(_ context.Context, key string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.items, key)
-	return nil
-}
+// NewMemoryEventStore returns an empty in-memory [Store].
+//
+// Deprecated: use [NewMemoryStore] (renamed in 0.2.0).
+func NewMemoryEventStore() *MemoryStore { return NewMemoryStore() }
 
 // ProcessStatus is the outcome of processing an event once.
 type ProcessStatus string
@@ -99,7 +38,7 @@ const (
 // retry and redelivery, and retries until it gets a 2xx (for about a day).
 type EventDeduplicator struct {
 	// Store keeps the ids (required). Its Add must be atomic.
-	Store EventStore
+	Store Store
 	// TTL is how long a processed id is remembered. Default 3 days.
 	TTL time.Duration
 	// LockTTL is how long a running handler holds the id before another delivery may
@@ -158,7 +97,7 @@ func (d *EventDeduplicator) Process(ctx context.Context, eventID string, handler
 }
 
 // runReleasing runs handler and deletes key when it fails or panics.
-func runReleasing(ctx context.Context, store EventStore, key string, handler func(context.Context) error) (err error) {
+func runReleasing(ctx context.Context, store Store, key string, handler func(context.Context) error) (err error) {
 	succeeded := false
 	defer func() {
 		if !succeeded {
@@ -177,7 +116,7 @@ func runReleasing(ctx context.Context, store EventStore, key string, handler fun
 // [EventDeduplicator.Process].
 //
 //	status, err := nine.ProcessEventOnce(ctx, store, event.ID, func(ctx context.Context) error { return handle(ctx, event) })
-func ProcessEventOnce(ctx context.Context, store EventStore, eventID string, handler func(context.Context) error) (ProcessStatus, error) {
+func ProcessEventOnce(ctx context.Context, store Store, eventID string, handler func(context.Context) error) (ProcessStatus, error) {
 	d := EventDeduplicator{Store: store}
 	return d.Process(ctx, eventID, handler)
 }

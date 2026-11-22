@@ -10,7 +10,7 @@ import (
 )
 
 func TestProcessEventOnce(t *testing.T) {
-	store := NewMemoryEventStore()
+	store := NewMemoryStore()
 	runs := 0
 	handler := func(context.Context) error { runs++; return nil }
 	if s, err := ProcessEventOnce(ctx, store, "evt_1", handler); s != Processed || err != nil {
@@ -32,7 +32,7 @@ func TestProcessEventOnce(t *testing.T) {
 }
 
 func TestProcessEventOnceReleasesOnFailureAndPanic(t *testing.T) {
-	store := NewMemoryEventStore()
+	store := NewMemoryStore()
 	boom := errors.New("boom")
 	if s, err := ProcessEventOnce(ctx, store, "evt_2", func(context.Context) error { return boom }); s != "" || !errors.Is(err, boom) {
 		t.Fatalf("%s %v", s, err)
@@ -57,7 +57,7 @@ func TestProcessEventOnceReleasesOnFailureAndPanic(t *testing.T) {
 }
 
 func TestProcessEventOnceInProgressAndLockExpiry(t *testing.T) {
-	store := NewMemoryEventStore()
+	store := NewMemoryStore()
 	c := newClock()
 	store.now = c.Now
 	d := &EventDeduplicator{Store: store, LockTTL: time.Minute, TTL: time.Hour, Prefix: "p:"}
@@ -92,8 +92,8 @@ func TestProcessEventOnceInProgressAndLockExpiry(t *testing.T) {
 	}
 }
 
-func TestMemoryEventStore(t *testing.T) {
-	s := NewMemoryEventStore()
+func TestMemoryStore(t *testing.T) {
+	s := NewMemoryStore()
 	c := newClock()
 	s.now = c.Now
 	if ok, _ := s.Add(ctx, "k", "v", time.Second); !ok {

@@ -53,11 +53,14 @@ type VerifierConfig struct {
 	// CacheTTL is the longest a hybrid answer is trusted without news from 9in.
 	// Default 5 minutes. An answer is never kept past the token's expiry.
 	CacheTTL time.Duration
-	// Cache keeps hybrid answers. Default: in memory, per process, CacheSize entries.
-	// Use a shared AnswerCache when several processes should see the same evictions.
-	Cache AnswerCache
-	// CacheSize is the most answers the default cache keeps (default 10 000; the least
-	// recently used go first).
+	// Store keeps hybrid answers in a store shared by all your processes (Redis, your
+	// database), so a revocation webhook received by one of them reaches them all: the
+	// process that gets the event writes a small revocation marker, which every process
+	// checks before trusting a cached answer. The same Store can serve [WebhookHandler].
+	// Default: in memory, per process (then every process must get the webhooks).
+	Store Store
+	// CacheSize is the most answers the default in-memory cache keeps (default 10 000;
+	// the least recently used go first). Not used with Store.
 	CacheSize int
 
 	// Leeway is the clock skew allowed for exp and nbf. Default 30 seconds.
@@ -105,7 +108,7 @@ type Verifier struct {
 	http         *http.Client
 	provider     *provider
 	keys         *keySet
-	answers      AnswerCache
+	answers      answerCache
 	inflight     flight[Claims]
 	now          func() time.Time
 }
@@ -144,7 +147,6 @@ func NewVerifier(cfg VerifierConfig) (*Verifier, error) {
 		ttl:          cfg.CacheTTL,
 		leeway:       cfg.Leeway,
 		http:         newHTTPClient(cfg.HTTPClient),
-		answers:      cfg.Cache,
 		now:          time.Now,
 	}
 	for _, a := range append([]string{cfg.Audience}, cfg.Audiences...) {
@@ -158,8 +160,11 @@ func NewVerifier(cfg VerifierConfig) (*Verifier, error) {
 	if v.leeway <= 0 {
 		v.leeway = 30 * time.Second
 	}
-	if v.answers == nil {
-		v.answers = NewMemoryAnswerCache(cfg.CacheSize)
+	clock := func() time.Time { return v.now() }
+	if cfg.Store != nil {
+		v.answers = newStoreAnswers(cfg.Store, issuer, v.ttl, v.leeway, clock)
+	} else {
+		v.answers = newMemoryAnswers(cfg.CacheSize, clock)
 	}
 	v.provider = newProvider(issuer, v.http)
 	v.keys = newKeySet(v.provider, v.http, func() time.Time { return v.now() })
@@ -389,10 +394,13 @@ func tokenKey(token string) string {
 func (v *Verifier) lookup(ctx context.Context, token string, local Claims) (Claims, error) {
 	key := tokenKey(token)
 	if v.mode == ModeHybrid {
-		if hit, ok := v.answers.Get(ctx, key); ok && hit.Until.After(v.now()) {
+		if hit, ok := v.answers.get(ctx, key); ok && hit.Until.After(v.now()) {
 			return hit.Claims, nil
 		}
 	}
+	// When 9in was asked, not when it answered: a revocation that lands while the request
+	// is in flight must still make this answer stale.
+	asked := v.now()
 	answer, err := v.inflight.do(ctx, key, func(ctx context.Context) (Claims, error) {
 		return v.introspect(ctx, token)
 	})
@@ -428,7 +436,7 @@ func (v *Verifier) lookup(ctx context.Context, token string, local Claims) (Clai
 			until = now.Add(time.Minute)
 		}
 		if until.After(now) {
-			v.answers.Set(ctx, key, CachedAnswer{Claims: claims, Until: until})
+			v.answers.set(ctx, key, cachedAnswer{Claims: claims, Until: until, At: asked})
 		}
 	}
 	return claims, nil
@@ -462,29 +470,34 @@ var userEvictingEvents = map[string]bool{
 	"user.password_changed": true,
 }
 
-// HandleEvent drops the cached hybrid answers a webhook event makes stale and returns how
-// many: token.revoked (an access token) by jti, session.revoked by sid, and
-// user.sessions_revoked, user.deleted, user.updated and user.password_changed by user.
-// Subscribe your webhook endpoint to those events and pass every verified event here
-// ([WebhookConfig].Verifier does it for you).
-func (v *Verifier) HandleEvent(ctx context.Context, event *WebhookEvent) int {
+// HandleEvent drops the cached hybrid answers a webhook event makes stale: token.revoked
+// (an access token) by jti, session.revoked by sid, and user.sessions_revoked,
+// user.deleted, user.updated and user.password_changed by user. Subscribe your webhook
+// endpoint to those events and pass every verified event here ([WebhookConfig].Verifier
+// does it for you).
+//
+// It returns how many answers it dropped from the in-memory cache, or, with a shared
+// [VerifierConfig].Store, 1 when it wrote a revocation marker (the answers it covers can't
+// be counted). An error means the shared store couldn't be written: answer the webhook
+// with a 5xx so 9in delivers it again.
+func (v *Verifier) HandleEvent(ctx context.Context, event *WebhookEvent) (int, error) {
 	if event == nil {
-		return 0
+		return 0, nil
 	}
 	data := event.Data
 	str := func(name string) string { s, _ := data[name].(string); return s }
 	switch {
 	case event.EventType == "token.revoked" && str("token_type") == "access_token" && str("jti") != "":
-		return v.answers.Evict(ctx, "jti", str("jti"))
+		return v.answers.evict(ctx, "jti", str("jti"))
 	case event.EventType == "session.revoked" && str("sid") != "":
-		return v.answers.Evict(ctx, "sid", str("sid"))
+		return v.answers.evict(ctx, "sid", str("sid"))
 	case userEvictingEvents[event.EventType]:
 		if id := event.UserID(); id != "" {
-			return v.answers.Evict(ctx, "sub", id)
+			return v.answers.evict(ctx, "sub", id)
 		}
 	}
-	return 0
+	return 0, nil
 }
 
-// Clear forgets every cached hybrid answer.
-func (v *Verifier) Clear(ctx context.Context) { v.answers.Clear(ctx) }
+// Clear forgets every cached hybrid answer (in every process, with a shared Store).
+func (v *Verifier) Clear(ctx context.Context) error { return v.answers.clear(ctx) }

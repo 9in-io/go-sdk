@@ -9,12 +9,13 @@
 //     RFC 9207 iss check, ID token verification, refresh token rotation, logout).
 //   - Protecting APIs: [Verifier] checks access tokens locally with every algorithm of
 //     9in's key library, or in hybrid mode (local check plus one cached introspection per
-//     token, evicted by webhooks) so revocations apply at once. [RequireAuth] is the
-//     net/http middleware and [ClaimsFrom] reads the claims.
+//     token, evicted by webhooks) so revocations apply at once; a shared [Store] carries
+//     the answers and revocations to every process. [RequireAuth] is the net/http
+//     middleware and [ClaimsFrom] reads the claims.
 //   - The Management API: [ManagementClient] (users, sessions, login links, imports).
 //   - Keeping users in your own database: [AdapterHandler] serves the adapter protocol v2.
 //   - Webhooks: [VerifyWebhook] and [WebhookHandler], which processes each event once
-//     ([EventStore], [MemoryEventStore]).
+//     (with a [Store]: [MemoryStore] for one process, Redis or a database for several).
 //   - CLIs, devices and services: [DeviceAuth] (RFC 8628) and [ClientCredentials].
 //
 // Every type is safe for concurrent use: create clients once and share them. Every call

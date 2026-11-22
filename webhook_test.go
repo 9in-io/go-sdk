@@ -222,7 +222,7 @@ func TestWebhookHandlerEvictsTheVerifierAndHonoursOptions(t *testing.T) {
 }
 
 // A store whose writes fail.
-type brokenStore struct{ MemoryEventStore }
+type brokenStore struct{ MemoryStore }
 
 func (b *brokenStore) Add(context.Context, string, string, time.Duration) (bool, error) {
 	return false, errors.New("redis down")

@@ -1,0 +1,17 @@
+# Test and coverage output
+*.test
+*.out
+coverage.html
+
+# Example binaries
+/examples/*/webapp
+/examples/*/api
+/examples/*/device
+
+# Local settings (never commit secrets)
+.env
+.env.*
+
+.DS_Store
+.idea/
+.vscode/
